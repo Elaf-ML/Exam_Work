@@ -1,0 +1,138 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Poppins:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply text-base;
+  }
+  
+  body {
+    @apply bg-dark text-white font-sans min-h-screen;
+  }
+  
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-gaming tracking-tight;
+  }
+  
+  button:focus, a:focus {
+    @apply outline-offset-2 outline-primary/50;
+  }
+  
+  /* Better focus styles for accessibility */
+  *:focus-visible {
+    @apply outline-2 outline-dashed outline-primary;
+  }
+}
+
+/* Custom styles */
+h1 {
+  @apply text-2xl md:text-3xl lg:text-4xl font-bold;
+}
+
+h2 {
+  @apply text-xl md:text-2xl lg:text-3xl font-bold;
+}
+
+h3 {
+  @apply text-lg md:text-xl lg:text-2xl font-bold;
+}
+
+.custom-box {
+  background-color: purple;
+  color: white;
+  padding: 20px;
+  border-radius: 8px;
+  margin: 10px;
+}
+
+:root {
+  --primary: #8B5CF6;
+  --primary-dark: #7C3AED;
+  --primary-light: #A78BFA;
+  --dark: #121212;
+  --dark-light: #1E1E1E;
+  --dark-lighter: #2D2D2D;
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-primary hover:bg-primary-dark text-white font-bold py-2 px-4 rounded-md transition duration-300 ease-in-out focus:ring-2 focus:ring-primary-light/50;
+  }
+  
+  .btn-secondary {
+    @apply bg-dark-light hover:bg-dark-lighter text-white font-bold py-2 px-4 rounded-md border border-primary transition duration-300 ease-in-out focus:ring-2 focus:ring-primary-light/50;
+  }
+  
+  .card-game {
+    @apply bg-dark-light rounded-lg p-4 border-2 border-transparent hover:border-primary transition-all duration-300 shadow-lg hover:shadow-primary/20;
+  }
+  
+  .game-title {
+    @apply text-lg sm:text-xl md:text-2xl font-gaming font-bold text-primary;
+  }
+  
+  .gradient-text {
+    @apply text-transparent bg-clip-text bg-gradient-to-r from-primary to-primary-light;
+  }
+  
+  .nav-link {
+    @apply px-3 md:px-4 py-2 text-gray-300 hover:text-primary transition-colors duration-300;
+  }
+  
+  .nav-link-active {
+    @apply px-3 md:px-4 py-2 text-primary border-b-2 border-primary;
+  }
+  
+  .game-container {
+    @apply bg-dark-light rounded-xl p-4 md:p-6 shadow-lg border border-dark-lighter;
+  }
+  
+  /* Responsive container */
+  .container {
+    @apply px-4 mx-auto sm:px-6 lg:px-8;
+    max-width: 1400px;
+  }
+  
+  /* Responsive grid */
+  .responsive-grid {
+    @apply grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6;
+  }
+  
+  /* Responsive padding */
+  .responsive-p {
+    @apply p-4 sm:p-6 md:p-8;
+  }
+  
+  /* Responsive margin */
+  .responsive-m {
+    @apply m-4 sm:m-6 md:m-8;
+  }
+  
+  /* Fix for mobile devices */
+  input, select, textarea, button {
+    @apply max-w-full;
+    font-size: 16px; /* Prevents zoom on iOS */
+  }
+  
+  /* Device-specific fixes */
+  @media (max-width: 640px) {
+    .hide-scrollbar {
+      -ms-overflow-style: none;  /* IE and Edge */
+      scrollbar-width: none;  /* Firefox */
+    }
+    .hide-scrollbar::-webkit-scrollbar {
+      display: none; /* Chrome, Safari, Opera*/
+    }
+  }
+  
+  /* Safe area insets for notched phones */
+  .safe-area-inset {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

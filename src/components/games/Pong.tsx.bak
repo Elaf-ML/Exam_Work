@@ -1,0 +1,1274 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { motion, AnimatePresence, useAnimation } from 'framer-motion';
+import { useAuth } from '../../context/AuthContext';
+import { doc, updateDoc, getDoc, increment, collection, query, orderBy, limit, getDocs, setDoc, onSnapshot, where } from 'firebase/firestore';
+import { db } from '../../firebase/config';
+import useWindowSize from 'react-use/lib/useWindowSize';
+import Confetti from 'react-confetti';
+import { useRouter } from 'next/router';
+import { toast } from 'react-hot-toast';
+
+// Types
+type GameState = 'READY' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
+type Difficulty = 'easy' | 'medium' | 'hard';
+type PaddleDirection = 'UP' | 'DOWN' | 'NONE';
+type GameMode = 'singlePlayer' | 'twoPlayer' | 'ai';
+
+interface Paddle {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  speed: number;
+  score: number;
+  direction: PaddleDirection;
+}
+
+interface Ball {
+  x: number;
+  y: number;
+  radius: number;
+  speedX: number;
+  speedY: number;
+}
+
+interface PowerUp {
+  type: 'paddleSize' | 'ballSpeed' | 'extraPoint';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  active: boolean;
+  duration: number;
+  collected: boolean;
+}
+
+// Additional type for multiplayer game rooms
+type MultiplayerRoom = {
+  id: string;
+  hostId: string;
+  guestId?: string;
+  createdAt: number;
+  status: 'waiting' | 'playing' | 'finished';
+  settings?: {
+    difficulty: string;
+    maxScore: number;
+  };
+  winner?: 'host' | 'guest';
+};
+
+// Add constants for game configuration
+const MAX_BALL_SPEED_X = 12; // Maximum ball horizontal speed
+const MAX_BALL_SPEED_Y = 8;  // Maximum ball vertical speed
+
+const Pong = () => {
+
+  // Game state
+  const [gameState, setGameState] = useState<GameState>('READY');
+  const [difficulty, setDifficulty] = useState<Difficulty>('medium');
+  const [gameMode, setGameMode] = useState<GameMode>('singlePlayer');
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [powerUpsEnabled, setPowerUpsEnabled] = useState(true);
+  
+  // Multiplayer state
+  const [isMultiplayerInvite, setIsMultiplayerInvite] = useState(false);
+  const [multiplayerRoom, setMultiplayerRoom] = useState<MultiplayerRoom | null>(null);
+  const [isHost, setIsHost] = useState(true);
+  const [inviteUrl, setInviteUrl] = useState('');
+  const [isWaitingForOpponent, setIsWaitingForOpponent] = useState(false);
+  
+  // Game elements
+  const [leftPaddle, setLeftPaddle] = useState<Paddle>({
+    x: 20,
+    y: 0,
+    width: 10,
+    height: 100,
+    speed: 8,
+    score: 0,
+    direction: 'NONE'
+  });
+  
+  const [rightPaddle, setRightPaddle] = useState<Paddle>({
+    x: 0, // Will be calculated based on canvas width
+    y: 0,
+    width: 10,
+    height: 100,
+    speed: 8,
+    score: 0,
+    direction: 'NONE'
+  });
+  
+  const [ball, setBall] = useState<Ball>({
+    x: 0, // Will be calculated based on canvas width
+    y: 0, // Will be calculated based on canvas height
+    radius: 8,
+    speedX: 5,
+    speedY: 5
+  });
+  
+  const [powerUp, setPowerUp] = useState<PowerUp | null>(null);
+  
+  // Stats
+  const [timer, setTimer] = useState(0);
+  const [highScore, setHighScore] = useState<number | null>(null);
+  const [gamesPlayed, setGamesPlayed] = useState(0);
+  const [winner, setWinner] = useState<'player' | 'opponent' | null>(null);
+  
+  // Refs
+  const gameContainerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationRef = useRef<number>(0);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Auth
+  const { currentUser } = useAuth();
+  // We need width and height for confetti on game over
+  const { width: windowWidth, height: windowHeight } = useWindowSize();
+
+  // Add a ref to store the current game data
+  const gameDataRef = useRef<any>(null);
+
+  // Add leaderboard state
+  const [leaderboard, setLeaderboard] = useState<Array<{username: string, score: number}>>([]);
+  const [isLoadingLeaderboard, setIsLoadingLeaderboard] = useState(false);
+  
+  // Load user stats
+  useEffect(() => {
+    if (currentUser) {
+      loadUserStats();
+    }
+  }, [currentUser]);
+  
+  const loadUserStats = async () => {
+    if (!currentUser) return;
+    
+    try {
+      const userRef = doc(db, 'users', currentUser.uid);
+      const userDoc = await getDoc(userRef);
+      
+      if (userDoc.exists()) {
+        const userData = userDoc.data();
+        if (userData.games && userData.games.pong) {
+          setHighScore(userData.games.pong.highScore || null);
+          setGamesPlayed(userData.games.pong.gamesPlayed || 0);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading user stats:', error);
+    }
+  };
+
+  // Initialize game elements based on canvas size
+  const initializeGame = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+    
+    // Initialize paddle positions
+    setLeftPaddle(prev => ({
+      ...prev,
+      y: canvasHeight / 2 - prev.height / 2,
+      score: 0,
+      direction: 'NONE'
+    }));
+    
+    setRightPaddle(prev => ({
+      ...prev,
+      x: canvasWidth - prev.width - 20,
+      y: canvasHeight / 2 - prev.height / 2,
+      score: 0,
+      direction: 'NONE'
+    }));
+    
+    // Initialize ball position
+    setBall(prev => ({
+      ...prev,
+      x: canvasWidth / 2,
+      y: canvasHeight / 2,
+      speedX: difficulty === 'easy' ? 4 : difficulty === 'medium' ? 6 : 8,
+      speedY: (Math.random() * 4) - 2
+    }));
+    
+    // Reset power-up
+    setPowerUp(null);
+    
+    // Reset timer
+    setTimer(0);
+  };
+  
+  // Apply difficulty settings
+  const applyDifficulty = () => {
+    let paddleHeight, ballSpeed, aiSpeed;
+    
+    switch(difficulty) {
+      case 'easy':
+        paddleHeight = 120;
+        ballSpeed = 4;
+        aiSpeed = 3;
+        break;
+      case 'medium':
+        paddleHeight = 100;
+        ballSpeed = 6;
+        aiSpeed = 4;
+        break;
+      case 'hard':
+        paddleHeight = 80;
+        ballSpeed = 8;
+        aiSpeed = 6;
+        break;
+      default:
+        paddleHeight = 100;
+        ballSpeed = 6;
+        aiSpeed = 4;
+    }
+    
+    setLeftPaddle(prev => ({
+      ...prev,
+      height: paddleHeight,
+      speed: gameMode === 'twoPlayer' ? 8 : 8
+    }));
+    
+    setRightPaddle(prev => ({
+      ...prev,
+      height: paddleHeight,
+      speed: gameMode === 'ai' ? aiSpeed : 8
+    }));
+    
+    setBall(prev => ({
+      ...prev,
+      speedX: prev.speedX > 0 ? ballSpeed : -ballSpeed
+    }));
+  };
+  
+  // Start game timer
+  useEffect(() => {
+    if (gameState === 'PLAYING') {
+      timerRef.current = setInterval(() => {
+        setTimer(prevTimer => prevTimer + 1);
+      }, 1000);
+    } else if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+    
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, [gameState]);
+
+  // Initialize canvas when component mounts
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    // Set initial canvas dimensions
+    const container = gameContainerRef.current;
+    if (container) {
+      const containerWidth = container.clientWidth;
+      const containerHeight = container.clientHeight;
+      
+      // Set explicit dimensions
+      canvas.width = Math.min(800, containerWidth - 40);
+      canvas.height = Math.min(500, containerHeight - 200);
+      
+      // Force a redraw of the background
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'rgb(17, 24, 39)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+  }, []);
+
+  // Start a new game with simplified approach
+  const startGame = () => {
+    console.log("Starting game...");
+    
+    // Set state to playing first
+    setGameState('PLAYING');
+    
+    // Stop any existing animation
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+    }
+    
+    // Wait a moment for state change to propagate and canvas to be visible
+    setTimeout(() => {
+      console.log("Initializing canvas after state change...");
+      
+      // Get canvas
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        console.error("Canvas reference is still null after delay");
+        return;
+      }
+      
+      // Make sure canvas has proper dimensions
+      const container = gameContainerRef.current;
+      if (container) {
+        canvas.width = Math.min(800, container.clientWidth - 40);
+        canvas.height = Math.min(500, container.clientHeight - 200);
+      }
+      
+      console.log("Canvas dimensions:", canvas.width, canvas.height);
+      
+      // Get drawing context
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        console.error("Could not get 2D context");
+        return;
+      }
+      
+      // DIRECT DRAWING APPROACH (no state)
+      // Clear everything
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      
+      // Draw background
+      ctx.fillStyle = 'rgb(17, 24, 39)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      // Draw center line
+      ctx.setLineDash([10, 15]);
+      ctx.beginPath();
+      ctx.moveTo(canvas.width / 2, 0);
+      ctx.lineTo(canvas.width / 2, canvas.height);
+      ctx.strokeStyle = 'rgba(146, 151, 180, 0.4)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      
+      // Create direct game objects (not using state)
+      const canvasWidth = canvas.width;
+      const canvasHeight = canvas.height;
+      
+      // Paddle dimensions
+      const paddleWidth = 10;
+      let paddleHeight = 100;
+      if (difficulty === 'easy') paddleHeight = 120;
+      if (difficulty === 'hard') paddleHeight = 80;
+      
+      // Reset scores
+      setLeftPaddle(prev => ({ ...prev, score: 0 }));
+      setRightPaddle(prev => ({ ...prev, score: 0 }));
+      
+      // Paddle positions
+      const leftPaddleX = 20;
+      const leftPaddleY = canvasHeight / 2 - paddleHeight / 2;
+      const rightPaddleX = canvasWidth - paddleWidth - 20;
+      const rightPaddleY = canvasHeight / 2 - paddleHeight / 2;
+      
+      // Ball setup
+      const ballRadius = 8;
+      const ballX = canvasWidth / 2;
+      const ballY = canvasHeight / 2;
+      
+      // Draw paddles
+      ctx.fillStyle = 'rgb(168, 85, 247)'; // Purple for left paddle
+      ctx.fillRect(leftPaddleX, leftPaddleY, paddleWidth, paddleHeight);
+      
+      ctx.fillStyle = gameMode === 'ai' ? 'rgb(239, 68, 68)' : 'rgb(59, 130, 246)'; 
+      ctx.fillRect(rightPaddleX, rightPaddleY, paddleWidth, paddleHeight);
+      
+      // Draw ball
+      ctx.beginPath();
+      ctx.arc(ballX, ballY, ballRadius, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgb(249, 250, 251)';
+      ctx.fill();
+      ctx.closePath();
+      
+      // Draw scores
+      ctx.font = 'bold 48px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+      ctx.fillText('0', canvasWidth / 4, 50);
+      ctx.fillText('0', (canvasWidth / 4) * 3, 50);
+      
+      // Initial state setup for game loop
+      const gameData = {
+        leftPaddle: {
+          x: leftPaddleX,
+          y: leftPaddleY,
+          width: paddleWidth,
+          height: paddleHeight,
+          speed: 8,
+          score: 0,
+          direction: 'NONE' as PaddleDirection
+        },
+        rightPaddle: {
+          x: rightPaddleX,
+          y: rightPaddleY,
+          width: paddleWidth,
+          height: paddleHeight,
+          speed: gameMode === 'ai' ? 
+            (difficulty === 'easy' ? 3 : difficulty === 'medium' ? 4 : 6) : 8,
+          score: 0,
+          direction: 'NONE' as PaddleDirection
+        },
+        ball: {
+          x: ballX,
+          y: ballY,
+          radius: ballRadius,
+          speedX: difficulty === 'easy' ? 4 : difficulty === 'medium' ? 6 : 8,
+          speedY: (Math.random() * 4) - 2
+        },
+        isPaused: false,
+        isActive: true, // Flag to track if game is active
+        internalGameState: 'PLAYING' as GameState // Internal game state tracking
+      };
+      
+      // Store game data in ref for external access
+      gameDataRef.current = gameData;
+      
+      console.log("Initial ball speeds:", gameData.ball.speedX, gameData.ball.speedY);
+      
+      // Set state
+      setLeftPaddle(gameData.leftPaddle);
+      setRightPaddle(gameData.rightPaddle);
+      setBall(gameData.ball);
+      setPowerUp(null);
+      setTimer(0);
+      
+      // Simple game loop
+      let lastTime = 0;
+      const simplifiedGameLoop = (timestamp: number) => {
+        // Calculate delta time
+        const deltaTime = lastTime ? (timestamp - lastTime) / 16 : 1;
+        lastTime = timestamp;
+        
+        // Check if game is still active
+        if (!gameData.isActive) {
+          console.log("Game no longer active, stopping loop");
+          return;
+        }
+        
+        // Check internal game state
+        if (gameData.internalGameState !== 'PLAYING') {
+          console.log("Game not in playing state, stopping loop");
+          gameData.isActive = false;
+          return;
+        }
+        
+        // Clear canvas
+        ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+        
+        // Draw background
+        ctx.fillStyle = 'rgb(17, 24, 39)';
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+        
+        // Draw center line
+        ctx.setLineDash([10, 15]);
+        ctx.beginPath();
+        ctx.moveTo(canvasWidth / 2, 0);
+        ctx.lineTo(canvasWidth / 2, canvasHeight);
+        ctx.strokeStyle = 'rgba(146, 151, 180, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        // Update left paddle position based on internal gameData direction
+        if (gameData.leftPaddle.direction === 'UP') {
+          gameData.leftPaddle.y = Math.max(0, gameData.leftPaddle.y - gameData.leftPaddle.speed * deltaTime);
+          
+          // Sync paddle position in multiplayer mode
+          if (multiplayerRoom && isHost && timestamp % 30 < 16) {
+            sendPaddleUpdate(gameData.leftPaddle.y);
+          }
+        } else if (gameData.leftPaddle.direction === 'DOWN') {
+          gameData.leftPaddle.y = Math.min(
+            canvasHeight - gameData.leftPaddle.height, 
+            gameData.leftPaddle.y + gameData.leftPaddle.speed * deltaTime
+          );
+          
+          // Sync paddle position in multiplayer mode
+          if (multiplayerRoom && isHost && timestamp % 30 < 16) {
+            sendPaddleUpdate(gameData.leftPaddle.y);
+          }
+        }
+        
+        // Update right paddle position based on game mode
+        if (gameMode === 'ai') {
+          // AI logic
+          const paddleCenter = gameData.rightPaddle.y + gameData.rightPaddle.height / 2;
+          const ballCenterY = gameData.ball.y;
+          
+          if (gameData.ball.speedX > 0) { // Only move when ball is coming towards AI
+            if (paddleCenter < ballCenterY - 10) {
+              gameData.rightPaddle.y = Math.min(
+                canvasHeight - gameData.rightPaddle.height, 
+                gameData.rightPaddle.y + gameData.rightPaddle.speed
+              );
+            } else if (paddleCenter > ballCenterY + 10) {
+              gameData.rightPaddle.y = Math.max(0, gameData.rightPaddle.y - gameData.rightPaddle.speed);
+            }
+          }
+        } else {
+          // Player control - use internal gameData direction
+          if (gameData.rightPaddle.direction === 'UP') {
+            gameData.rightPaddle.y = Math.max(0, gameData.rightPaddle.y - gameData.rightPaddle.speed * deltaTime);
+            
+            // Sync paddle position in multiplayer mode
+            if (multiplayerRoom && !isHost && timestamp % 30 < 16) {
+              sendPaddleUpdate(gameData.rightPaddle.y);
+            }
+          } else if (gameData.rightPaddle.direction === 'DOWN') {
+            gameData.rightPaddle.y = Math.min(
+              canvasHeight - gameData.rightPaddle.height, 
+              gameData.rightPaddle.y + gameData.rightPaddle.speed * deltaTime
+            );
+            
+            // Sync paddle position in multiplayer mode
+            if (multiplayerRoom && !isHost && timestamp % 30 < 16) {
+              sendPaddleUpdate(gameData.rightPaddle.y);
+            }
+          }
+        }
+        
+        // Update ball position
+        let newX = gameData.ball.x + gameData.ball.speedX;
+        let newY = gameData.ball.y + gameData.ball.speedY;
+        
+        // Bounce off top and bottom walls
+        if (newY - gameData.ball.radius < 0 || newY + gameData.ball.radius > canvasHeight) {
+          gameData.ball.speedY = -gameData.ball.speedY;
+          newY = gameData.ball.y + gameData.ball.speedY; // Recalculate with new speed
+        }
+        
+        // Check collision with left paddle
+        if (
+          newX - gameData.ball.radius < gameData.leftPaddle.x + gameData.leftPaddle.width &&
+          newX + gameData.ball.radius > gameData.leftPaddle.x &&
+          newY > gameData.leftPaddle.y &&
+          newY < gameData.leftPaddle.y + gameData.leftPaddle.height
+        ) {
+          // Calculate bounce angle based on where the ball hits the paddle
+          const hitPosition = (newY - (gameData.leftPaddle.y + gameData.leftPaddle.height / 2)) / (gameData.leftPaddle.height / 2);
+          gameData.ball.speedX = Math.abs(gameData.ball.speedX); // Bounce right
+          gameData.ball.speedY = hitPosition * 6; // Adjust angle based on hit position
+          
+          // Speed up slightly after each hit
+          gameData.ball.speedX *= 1.05;
+          
+          // Recalculate position with new speed
+          newX = gameData.ball.x + gameData.ball.speedX;
+        }
+        
+        // Check collision with right paddle
+        if (
+          newX + gameData.ball.radius > gameData.rightPaddle.x &&
+          newX - gameData.ball.radius < gameData.rightPaddle.x + gameData.rightPaddle.width &&
+          newY > gameData.rightPaddle.y &&
+          newY < gameData.rightPaddle.y + gameData.rightPaddle.height
+        ) {
+          // Calculate bounce angle based on where the ball hits the paddle
+          const hitPosition = (newY - (gameData.rightPaddle.y + gameData.rightPaddle.height / 2)) / (gameData.rightPaddle.height / 2);
+          gameData.ball.speedX = -Math.abs(gameData.ball.speedX); // Bounce left
+          gameData.ball.speedY = hitPosition * 6; // Adjust angle based on hit position
+          
+          // Speed up slightly after each hit
+          gameData.ball.speedX *= 1.05;
+          
+          // Recalculate position with new speed
+          newX = gameData.ball.x + gameData.ball.speedX;
+        }
+        
+        // Ball goes off left edge - point for right
+        if (newX - gameData.ball.radius < 0) {
+          // Update score
+          gameData.rightPaddle.score += 1;
+          
+          // Reset ball to center
+          newX = canvasWidth / 2;
+          newY = canvasHeight / 2;
+          gameData.ball.speedX = Math.abs(gameData.ball.speedX); // Move right
+          gameData.ball.speedY = (Math.random() * 4) - 2; // Random vertical direction
+          
+          // Check for game over
+          if (gameData.rightPaddle.score >= getWinningScore()) {
+            // Update state with current values before game over
+            setRightPaddle(gameData.rightPaddle);
+            setLeftPaddle(gameData.leftPaddle);
+            setBall(gameData.ball);
+            
+            // Use setTimeout to allow the state update to complete first
+            setTimeout(() => gameOver('opponent'), 0);
+            return; // Exit early to prevent further updates
+          }
+        }
+        
+        // Ball goes off right edge - point for left
+        if (newX + gameData.ball.radius > canvasWidth) {
+          // Update score
+          gameData.leftPaddle.score += 1;
+          
+          // Reset ball to center
+          newX = canvasWidth / 2;
+          newY = canvasHeight / 2;
+          gameData.ball.speedX = -Math.abs(gameData.ball.speedX); // Move left
+          gameData.ball.speedY = (Math.random() * 4) - 2; // Random vertical direction
+          
+          // Check for game over
+          if (gameData.leftPaddle.score >= getWinningScore()) {
+            // Update state with current values before game over
+            setRightPaddle(gameData.rightPaddle);
+            setLeftPaddle(gameData.leftPaddle);
+            setBall(gameData.ball);
+            
+            // Use setTimeout to allow the state update to complete first
+            setTimeout(() => gameOver('player'), 0);
+            return; // Exit early to prevent further updates
+          }
+        }
+        
+        // Update final position
+        gameData.ball.x = newX;
+        gameData.ball.y = newY;
+        
+        // Update power-ups if enabled
+        if (powerUpsEnabled && powerUp) {
+          updatePowerUpState();
+        } else if (powerUpsEnabled && !powerUp && Math.random() < 0.002) {
+          spawnPowerUp(canvasWidth, canvasHeight);
+        }
+        
+        // Update the state with all changes
+        setLeftPaddle(gameData.leftPaddle);
+        setRightPaddle(gameData.rightPaddle);
+        setBall(gameData.ball);
+        
+        // Continue loop
+        animationRef.current = requestAnimationFrame(simplifiedGameLoop);
+      };
+      
+      // Initialize canvas size
+      useEffect(() => {
+        const updateCanvasSize = () => {
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          
+          // Set canvas size based on container
+          const container = gameContainerRef.current;
+          if (container) {
+            const containerWidth = container.clientWidth;
+            const containerHeight = container.clientHeight;
+            
+            // Set canvas dimensions
+            canvas.width = Math.min(800, containerWidth - 40);
+            canvas.height = Math.min(500, containerHeight - 200);
+            
+            // Reinitialize game elements if a game is in progress
+            if (gameState === 'PLAYING') {
+              initializeGame();
+            }
+          }
+        };
+        
+        // Update canvas size initially and on window resize
+        updateCanvasSize();
+        window.addEventListener('resize', updateCanvasSize);
+        
+        return () => {
+          window.removeEventListener('resize', updateCanvasSize);
+        };
+      }, [gameState]);
+      
+      // Initialize audio elements
+      useEffect(() => {
+        // Removed sound initialization
+      }, []);
+      
+      // Toggle fullscreen
+      const toggleFullscreen = () => {
+        if (!document.fullscreenElement) {
+          gameContainerRef.current?.requestFullscreen();
+          setIsFullscreen(true);
+        } else {
+          document.exitFullscreen();
+          setIsFullscreen(false);
+        }
+      };
+      
+      // Toggle power-ups
+      const togglePowerUps = () => {
+        setPowerUpsEnabled(!powerUpsEnabled);
+        
+        // Remove active power-up if disabled
+        if (!powerUpsEnabled && powerUp) {
+          removePowerUpEffect();
+          setPowerUp(null);
+        }
+      };
+      
+      // Clean up on unmount
+      useEffect(() => {
+        return () => {
+          if (animationRef.current) {
+            cancelAnimationFrame(animationRef.current);
+          }
+          
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+          }
+        };
+      }, []);
+
+      // Get winning score based on difficulty
+      const getWinningScore = () => {
+        switch (difficulty) {
+          case 'easy': return 5;
+          case 'medium': return 7;
+          case 'hard': return 10;
+          default: return 7;
+        }
+      };
+      
+      // Spawn a power-up
+      const spawnPowerUp = (canvasWidth: number, canvasHeight: number) => {
+        const types: PowerUp['type'][] = ['paddleSize', 'ballSpeed', 'extraPoint'];
+        const randomType = types[Math.floor(Math.random() * types.length)];
+        
+        const size = 20;
+        const x = Math.random() * (canvasWidth - size * 2) + size;
+        const y = Math.random() * (canvasHeight - size * 2) + size;
+        
+        setPowerUp({
+          type: randomType,
+          x,
+          y,
+          width: size,
+          height: size,
+          active: false,
+          duration: 7000, // 7 seconds
+          collected: false
+        });
+      };
+
+      // Create a module-scoped variable to track pause/resume timing
+      let resumeLastTime = 0;
+
+      // Enhanced win animation component
+      const WinAnimation = ({ winner }: { winner: 'player' | 'opponent' }) => {
+        return (
+          <>
+            {/* Confetti animation */}
+            {(gameMode === 'singlePlayer' || winner === 'player') && (
+              <Confetti
+                width={windowWidth}
+                height={windowHeight}
+                recycle={false}
+                numberOfPieces={300}
+                gravity={0.15}
+                colors={['#8B5CF6', '#6366F1', '#EC4899', '#8B5CF6', '#F97316']}
+                tweenDuration={5000}
+              />
+            )}
+            
+            {/* Trophy animation for winner */}
+            <motion.div
+              className="absolute top-10 left-1/2 transform -translate-x-1/2"
+              initial={{ y: -100, scale: 0, rotate: -20 }}
+              animate={{ y: 0, scale: 1, rotate: 0 }}
+              transition={{ 
+                type: "spring",
+                delay: 0.3,
+                duration: 0.8
+              }}
+            >
+              <div className="text-yellow-400 text-6xl mb-2">
+                🏆
+              </div>
+            </motion.div>
+            
+            {/* Victory text animation */}
+            <motion.div
+              className="absolute top-36 left-1/2 transform -translate-x-1/2 text-center"
+              initial={{ opacity: 0, scale: 0.5 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ delay: 0.5, duration: 0.5 }}
+            >
+              <h2 className="text-3xl font-bold bg-gradient-to-r from-yellow-400 to-yellow-300 text-transparent bg-clip-text mb-2">
+                {winner === 'player' ? 'VICTORY!' : 'GAME OVER!'}
+              </h2>
+            </motion.div>
+          </>
+        );
+      };
+
+      // Add multiplayer-related state
+      const [isMultiplayerInvite, setIsMultiplayerInvite] = useState(false);
+      const [multiplayerRoom, setMultiplayerRoom] = useState<MultiplayerRoom | null>(null);
+      const [isHost, setIsHost] = useState(false);
+      const [inviteUrl, setInviteUrl] = useState('');
+      const [isWaitingForOpponent, setIsWaitingForOpponent] = useState(false);
+      const [opponentUsername, setOpponentUsername] = useState('');
+      
+      // Router for handling URL parameters
+      const router = useRouter();
+      
+      // Check for invite in URL on component mount
+      useEffect(() => {
+        const { roomId } = router.query;
+        
+        if (roomId && typeof roomId === 'string') {
+          joinRoomAsGuest(roomId);
+        }
+      }, [router.query]);
+      
+      // Listen for changes to the multiplayer room if in a room
+      useEffect(() => {
+        if (!multiplayerRoom) return;
+        
+        const unsubscribe = onSnapshot(
+          doc(db, 'pongRooms', multiplayerRoom.id),
+          (snapshot) => {
+            const roomData = snapshot.data() as MultiplayerRoom | undefined;
+            
+            if (roomData) {
+              setMultiplayerRoom(roomData);
+              
+              // If waiting and guest joined, start the game
+              if (isHost && roomData.status === 'waiting' && roomData.guestId && isWaitingForOpponent) {
+                setIsWaitingForOpponent(false);
+                // Get the guest's username
+                getUsername(roomData.guestId).then(username => {
+                  setOpponentUsername(username || 'Opponent');
+                  toast.success(`${username || 'Opponent'} has joined the game!`);
+                  // Auto-start the game after a short delay
+                  setTimeout(() => {
+                    startMultiplayerGame(roomData);
+                  }, 1500);
+                });
+              }
+            }
+          },
+          (error) => {
+            console.error("Error listening to room updates:", error);
+            toast.error("Lost connection to the game room");
+          }
+        );
+        
+        return () => unsubscribe();
+      }, [multiplayerRoom, isHost, isWaitingForOpponent]);
+      
+      // Get username for a user ID
+      const getUsername = async (userId: string): Promise<string | null> => {
+        try {
+          const userDoc = await getDoc(doc(db, 'users', userId));
+          if (userDoc.exists()) {
+            const userData = userDoc.data();
+            return userData.displayName || userData.email?.split('@')[0] || null;
+          }
+          return null;
+        } catch (error) {
+          console.error("Error fetching username:", error);
+          return null;
+        }
+      };
+      
+      // Create a new multiplayer room and generate invite
+      const createMultiplayerInvite = async () => {
+        if (!currentUser) {
+          toast.error("You need to be logged in to create a multiplayer game");
+          return;
+        }
+        
+        try {
+          const roomId = Math.random().toString(36).substring(2, 10);
+          const roomData: MultiplayerRoom = {
+            id: roomId,
+            hostId: currentUser.uid,
+            createdAt: Date.now(),
+            status: 'waiting',
+            settings: {
+              difficulty,
+              maxScore: getWinningScore()
+            }
+          };
+          
+          await setDoc(doc(db, 'pongRooms', roomId), roomData);
+          
+          setMultiplayerRoom(roomData);
+          setIsHost(true);
+          setIsMultiplayerInvite(true);
+          setIsWaitingForOpponent(true);
+          
+          // Create invite URL
+          const baseUrl = window.location.origin + window.location.pathname;
+          const inviteLink = `${baseUrl}?roomId=${roomId}`;
+          setInviteUrl(inviteLink);
+          
+          toast.success('Multiplayer room created! Share the link with a friend.');
+        } catch (error) {
+          console.error('Error creating multiplayer room:', error);
+          toast.error('Failed to create multiplayer room');
+        }
+      };
+      
+      // Join room as guest
+      const joinRoomAsGuest = async (roomId: string) => {
+        if (!currentUser) {
+          toast.error('You need to be logged in to join a multiplayer game');
+          return;
+        }
+        
+        try {
+          const roomRef = doc(db, 'pongRooms', roomId);
+          const roomSnapshot = await getDoc(roomRef);
+          
+          if (!roomSnapshot.exists()) {
+            toast.error('Invalid room or the invitation has expired');
+            return;
+          }
+          
+          const roomData = roomSnapshot.data() as MultiplayerRoom;
+          
+          if (roomData.status !== 'waiting') {
+            toast.error('This game has already started or finished');
+            return;
+          }
+          
+          if (roomData.hostId === currentUser.uid) {
+            toast.error('You cannot join your own game as a guest');
+            return;
+          }
+          
+          // Update room with guest info
+          await updateDoc(roomRef, {
+            guestId: currentUser.uid
+          });
+          
+          setMultiplayerRoom(roomData);
+          setIsHost(false);
+          setGameMode('twoPlayer');
+          setDifficulty(roomData.settings?.difficulty as Difficulty || 'medium');
+          
+          toast.success('Successfully joined multiplayer game');
+        } catch (error) {
+          console.error('Error joining room:', error);
+          toast.error('Failed to join multiplayer game');
+        }
+      };
+      
+      // Cancel multiplayer invite
+      const cancelMultiplayerInvite = async () => {
+        if (multiplayerRoom?.id) {
+          try {
+            await updateDoc(doc(db, 'pongRooms', multiplayerRoom.id), {
+              status: 'finished'
+            });
+            
+            setMultiplayerRoom(null);
+            setIsMultiplayerInvite(false);
+            setIsWaitingForOpponent(false);
+            
+            toast.success('Multiplayer invite cancelled');
+          } catch (error) {
+            console.error('Error cancelling invite:', error);
+            toast.error('Failed to cancel invite');
+          }
+        }
+      };
+      
+      // Copy invite link to clipboard
+      const copyInviteLink = () => {
+        navigator.clipboard.writeText(inviteUrl)
+          .then(() => toast.success('Invite link copied to clipboard!'))
+          .catch(() => toast.error('Failed to copy link'));
+      };
+
+      // Check for room ID in URL when component mounts
+      useEffect(() => {
+        if (typeof window !== 'undefined') {
+          const urlParams = new URLSearchParams(window.location.search);
+          const roomId = urlParams.get('roomId');
+          
+          if (roomId) {
+            joinRoomAsGuest(roomId);
+          }
+        }
+      }, []);
+      
+      // Listen for changes in the multiplayer room
+      useEffect(() => {
+        if (multiplayerRoom?.id) {
+          const unsubscribe = onSnapshot(doc(db, 'pongRooms', multiplayerRoom.id), (docSnapshot) => {
+            if (docSnapshot.exists()) {
+              const roomData = docSnapshot.data() as MultiplayerRoom;
+              setMultiplayerRoom(roomData);
+              
+              // Auto-start game when guest joins
+              if (roomData.status === 'waiting' && roomData.guestId && isHost) {
+                updateDoc(doc(db, 'pongRooms', multiplayerRoom.id), {
+                  status: 'playing'
+                });
+                
+                setGameMode('twoPlayer');
+                setGameState('PLAYING');
+                startGame();
+              }
+              
+              // Start game for guest when host starts it
+              if (roomData.status === 'playing' && !isHost && gameState !== 'PLAYING') {
+                setGameMode('twoPlayer');
+                setGameState('PLAYING');
+                startGame();
+              }
+              
+              // Handle game results
+              if (roomData.status === 'finished' && roomData.winner) {
+                const isWinner = (isHost && roomData.winner === 'host') || (!isHost && roomData.winner === 'guest');
+                
+                if (isWinner) {
+                  setWinner('player');
+                } else {
+                  setWinner('opponent');
+                }
+                
+                setGameState('GAME_OVER');
+              }
+            }
+          });
+          
+          return () => unsubscribe();
+        }
+      }, [multiplayerRoom?.id, isHost]);
+
+      // Toggle pause state
+      const togglePause = () => {
+        if (gameState === 'PLAYING') {
+          setGameState('PAUSED');
+          
+          // Pause internal state as well
+          if (gameDataRef.current) {
+            gameDataRef.current.isPaused = true;
+          }
+          
+          // Stop animation loop
+          if (animationRef.current) {
+            cancelAnimationFrame(animationRef.current);
+            animationRef.current = 0;
+          }
+          
+          // Pause timer
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+          }
+        } else if (gameState === 'PAUSED') {
+          setGameState('PLAYING');
+          
+          // Resume internal state
+          if (gameDataRef.current) {
+            gameDataRef.current.isPaused = false;
+          }
+          
+          // Restart game loop with new timestamp to avoid jumps
+          resumeLastTime = 0;
+          animationRef.current = requestAnimationFrame(simplifiedGameLoop);
+          
+          // Resume timer
+          startTimer();
+        }
+      };
+
+      // Update power-up state
+      const updatePowerUpState = () => {
+        if (!powerUp) return;
+        
+        // Check if ball collides with power-up
+        if (
+          !powerUp.collected &&
+          ball.x + ball.radius > powerUp.x &&
+          ball.x - ball.radius < powerUp.x + powerUp.width &&
+          ball.y + ball.radius > powerUp.y &&
+          ball.y - ball.radius < powerUp.y + powerUp.height
+        ) {
+          // Collect power-up
+          const updatedPowerUp = {
+            ...powerUp,
+            collected: true,
+            active: true
+          };
+          
+          setPowerUp(updatedPowerUp);
+        }
+      };
+      
+      // Remove power-up effect
+      const removePowerUpEffect = () => {
+        if (!powerUp) return;
+        
+        setPowerUp(null);
+      };
+      
+      // Start timer function
+      const startTimer = () => {
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+        }
+        
+        timerRef.current = setInterval(() => {
+          setTimer(prevTimer => prevTimer + 1);
+        }, 1000);
+      };
+      
+      // Handle game over
+      const gameOver = (winner: 'player' | 'opponent') => {
+        setGameState('GAME_OVER');
+        
+        // Stop animation
+        if (animationRef.current) {
+          cancelAnimationFrame(animationRef.current);
+          animationRef.current = 0;
+        }
+        
+        // Update multiplayer room status if in a multiplayer game
+        if (multiplayerRoom) {
+          try {
+            updateDoc(doc(db, 'pongRooms', multiplayerRoom.id), {
+              status: 'finished',
+              winner: isHost ? (winner === 'player' ? 'host' : 'guest') : (winner === 'player' ? 'guest' : 'host')
+            });
+          } catch (error) {
+            console.error("Error updating multiplayer room status:", error);
+          }
+        }
+      };
+      
+      // Add simplified sendPaddleUpdate function
+      const sendPaddleUpdate = async (paddleY: number) => {
+        if (!multiplayerRoom) return;
+        
+        try {
+          const paddleField = isHost ? 'hostPaddleY' : 'guestPaddleY';
+          await updateDoc(doc(db, 'pongRooms', multiplayerRoom.id), {
+            [paddleField]: paddleY,
+            lastUpdate: Date.now()
+          });
+        } catch (error) {
+          console.error("Error sending paddle update:", error);
+        }
+      };
+
+      // Start the multiplayer game
+      const startMultiplayerGame = (room: MultiplayerRoom) => {
+        setGameMode('twoPlayer');
+        const difficultyValue = (room.settings?.difficulty as Difficulty) || 'medium';
+        setDifficulty(difficultyValue);
+        setPowerUpsEnabled(true);
+        setIsMultiplayerInvite(false);
+        startGame();
+      };
+
+      return (
+        <div className="pong-container relative p-4 md:p-6 bg-gray-900 min-h-screen flex flex-col justify-center items-center" ref={gameContainerRef}>
+          <div className="w-full max-w-4xl">
+            <div className="bg-gray-800 shadow-lg rounded-xl overflow-hidden">
+              <div className="p-4 md:p-6">
+                <div className="mb-4 flex justify-between items-center">
+                  <h2 className="text-2xl font-bold text-indigo-300">Pong</h2>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={togglePowerUps}
+                      className={`px-3 py-1 rounded text-sm ${
+                        powerUpsEnabled 
+                          ? 'bg-green-600 hover:bg-green-500 text-white' 
+                          : 'bg-gray-700 text-gray-300 hover:text-white'
+                      }`}
+                      title={powerUpsEnabled ? 'Disable power-ups' : 'Enable power-ups'}
+                    >
+                      Power-ups {powerUpsEnabled ? 'On' : 'Off'}
+                    </button>
+                  </div>
+                </div>
+                
+                <div className="game-wrapper">
+                  {/* Game content */}
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Multiplayer Invite UI */}
+          {isMultiplayerInvite && (
+            <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+              <div className="bg-gray-800 rounded-xl p-6 max-w-md w-full">
+                <h2 className="text-2xl font-bold text-indigo-300 mb-4">Multiplayer Game</h2>
+                
+                {isWaitingForOpponent ? (
+                  <div className="waiting-container">
+                    <p className="text-gray-300 mb-4">Waiting for opponent to join...</p>
+                    <div className="flex flex-col space-y-3 mb-4">
+                      <div className="invite-link-container flex">
+                        <input
+                          type="text"
+                          value={inviteUrl}
+                          readOnly
+                          className="bg-gray-700 text-gray-200 px-3 py-2 rounded-l flex-grow"
+                        />
+                        <button 
+                          className="copy-button bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-r"
+                          onClick={copyInviteLink}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                      <p className="text-gray-400 text-sm">Share this link with a friend to play together</p>
+                    </div>
+                    <div className="flex justify-end">
+                      <button 
+                        className="cancel-button bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded"
+                        onClick={cancelMultiplayerInvite}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="join-container">
+                    <p className="text-gray-300 mb-4">Enter the invite link you received:</p>
+                    <div className="flex flex-col space-y-3 mb-4">
+                      <input
+                        type="text"
+                        value={inviteUrl}
+                        onChange={(e) => setInviteUrl(e.target.value)}
+                        className="bg-gray-700 text-gray-200 px-3 py-2 rounded"
+                        placeholder="Paste invite link here"
+                      />
+                    </div>
+                    <div className="flex justify-between">
+                      <button 
+                        className="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded"
+                        onClick={() => setIsMultiplayerInvite(false)}
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded"
+                        onClick={() => {
+                          try {
+                            const url = new URL(inviteUrl);
+                            const roomId = new URLSearchParams(url.search).get('roomId');
+                            if (roomId) joinRoomAsGuest(roomId);
+                            else toast.error('Invalid invite link');
+                          } catch (error) {
+                            toast.error('Invalid URL format');
+                          }
+                        }}
+                      >
+                        Join Game
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    })
+  };
+
+  export default Pong; 
